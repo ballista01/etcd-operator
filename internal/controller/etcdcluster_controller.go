@@ -127,6 +127,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	sts, err := getStatefulSet(ctx, r.Client, etcdCluster.Name, etcdCluster.Namespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			etcdCluster.Status.Phase = "Creating"
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
 			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
@@ -209,6 +210,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
 		logger.Info("The expected number of replicas doesn't match the number of etcd members in the cluster", "targetReplica", targetReplica, "memberCnt", memberCnt)
+		etcdCluster.Status.Phase = "Scaling"
 		if int(targetReplica) < memberCnt {
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
@@ -232,7 +234,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		// Successfully adjusted STS, update status and requeue
 		etcdCluster.Status.ReadyReplicas = sts.Status.ReadyReplicas
-		etcdCluster.Status.Phase = "Scaling"
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
