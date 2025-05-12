@@ -139,7 +139,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if etcdCluster.Spec.Size == 0 {
 		logger.Info("EtcdCluster size is 0..Skipping next steps")
 		calculatedStatus.ReadyReplicas = 0
-		calculatedStatus.Members = 0
+		calculatedStatus.CurrentReplicas = 0
+		calculatedStatus.MembersCount = 0
 		cm.SetAvailable(false, status.ReasonSizeIsZero, "Desired cluster size is 0")
 		cm.SetProgressing(false, status.ReasonSizeIsZero, "Desired cluster size is 0")
 		return ctrl.Result{}, nil
@@ -176,6 +177,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				cm.SetDegraded(true, status.ReasonResourceCreateFail, status.FormatError("Failed to create StatefulSet", err))
 				return ctrl.Result{}, err
 			}
+			r.updateStatusFromStatefulSet(&calculatedStatus, sts) // Update after creation
 			// STS created with 0 replicas, needs scaling to 1. Set Initializing.
 			cm.SetProgressing(true, status.ReasonInitializingCluster, "StatefulSet created with 0 replicas, requires scaling to 1")
 		} else {
@@ -183,10 +185,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// attempt processing again later. This could have been caused by a
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
+			r.updateStatusFromStatefulSet(&calculatedStatus, nil)
 			cm.SetProgressing(false, status.ReasonStatefulSetGetError, status.FormatError("Failed to get StatefulSet", err)) // Stop progressing on persistent get error
 			cm.SetDegraded(true, status.ReasonStatefulSetGetError, status.FormatError("Failed to get StatefulSet", err))
+			r.updateStatusFromStatefulSet(&calculatedStatus, nil)
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
+	} else { // StatefulSet was found
+		r.updateStatusFromStatefulSet(&calculatedStatus, sts)
 	}
 
 	// At this point, sts should exist (either found or created)
@@ -195,6 +201,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		err = fmt.Errorf("statefulSet is unexpectedly nil after get/create")
 		logger.Error(err, "Internal error")
 		cm.SetDegraded(true, "InternalError", err.Error())
+		r.updateStatusFromStatefulSet(&calculatedStatus, nil)
 		return ctrl.Result{}, err
 	}
 
@@ -222,6 +229,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			cm.SetDegraded(true, status.ReasonResourceUpdateFail, status.FormatError("Failed to scale StatefulSet to 1", err))
 			return ctrl.Result{}, err
 		}
+		r.updateStatusFromStatefulSet(&calculatedStatus, sts)
 		// return ctrl.Result{RequeueAfter: requeueDuration}, nil // Requeue to check readiness, should we do it?
 	}
 
@@ -258,7 +266,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberListResp != nil {
 		memberCnt = len(memberListResp.Members)
 	}
-	calculatedStatus.Members = int32(memberCnt)
+	calculatedStatus.MembersCount = int32(memberCnt)
 
 	// ---------------------------------------------------------------------
 	// 6. Handle Member/Replica Mismatch
@@ -292,6 +300,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			cm.SetDegraded(true, status.ReasonResourceUpdateFail, status.FormatError("Failed to adjust StatefulSet replicas to match member count", err))
 			return ctrl.Result{}, err
 		}
+		r.updateStatusFromStatefulSet(&calculatedStatus, sts)
 		// Requeue to check state after adjustment
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
@@ -404,6 +413,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			cm.SetDegraded(true, status.ReasonResourceUpdateFail, status.FormatError("Failed to update STS during scaling", err))
 			return ctrl.Result{}, err
 		}
+		r.updateStatusFromStatefulSet(&calculatedStatus, sts)
 
 		// CHANGED BEHAVIOR: Scaling action initiated, requeue to wait for stabilization
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
@@ -414,6 +424,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// ---------------------------------------------------------------------
 	logger.Info("EtcdCluster is at the desired size and has no learners pending promotion")
 
+	r.updateStatusFromStatefulSet(&calculatedStatus, sts)
 	var allMembersHealthy bool
 	allMembersHealthy, err = areAllMembersHealthy(sts, logger) // Re-check health
 	if err != nil {
@@ -487,6 +498,26 @@ func (r *EtcdClusterReconciler) derivePhaseFromConditions(cluster *ecv1alpha1.Et
 	// Add logic for Terminating Phase if finalizers are implemented
 
 	cluster.Status.Phase = phase
+}
+
+func (r *EtcdClusterReconciler) updateStatusFromStatefulSet(
+	etcdClusterStatus *ecv1alpha1.EtcdClusterStatus, // Pass the status struct to modify
+	sts *appsv1.StatefulSet,
+) {
+	if sts == nil {
+		// If sts is nil, perhaps after a failed creation attempt.
+		// Set to 0 or ensure prior logic handles default state.
+		etcdClusterStatus.CurrentReplicas = 0
+		etcdClusterStatus.ReadyReplicas = 0
+		return
+	}
+
+	if sts.Spec.Replicas != nil {
+		etcdClusterStatus.CurrentReplicas = *sts.Spec.Replicas
+	} else {
+		etcdClusterStatus.CurrentReplicas = 0 // Should not occur with a valid STS spec
+	}
+	etcdClusterStatus.ReadyReplicas = sts.Status.ReadyReplicas
 }
 
 // SetupWithManager sets up the controller with the Manager.
