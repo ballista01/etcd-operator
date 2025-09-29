@@ -22,7 +22,6 @@ import (
 	"time"
 
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	"go.etcd.io/etcd-operator/pkg/status"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +34,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd-operator/pkg/status"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -94,7 +94,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// We use PatchStatusMutate. It fetches the latest object inside its retry loop.
 	// We prepare the *desired* status modifications in a 'calculatedStatus' variable
 	// within the Reconcile scope, and the mutate function applies these calculations.
-	var calculatedStatus ecv1alpha1.EtcdClusterStatus = etcdCluster.Status // Start with current status
+	calculatedStatus := etcdCluster.Status // Start with current status
 
 	// Initialize ConditionManager using the calculatedStatus *copy*.
 	// Modifications via cm will only affect this copy until the patch is applied.

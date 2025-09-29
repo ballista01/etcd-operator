@@ -125,10 +125,11 @@ func TestClusterHealth(t *testing.T) {
 				var foundHealthy, foundInvalid bool
 
 				for _, h := range health {
-					if h.Ep == healthyEp {
+					switch h.Ep {
+					case healthyEp:
 						healthyResult = h
 						foundHealthy = true
-					} else if h.Ep == "http://invalid:2379" {
+					case "http://invalid:2379":
 						invalidResult = h
 						foundInvalid = true
 					}
