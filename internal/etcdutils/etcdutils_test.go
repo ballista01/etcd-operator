@@ -1,6 +1,7 @@
 package etcdutils
 
 import (
+	"context"
 	"testing"
 	"time"
 
