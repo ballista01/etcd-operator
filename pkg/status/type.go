@@ -25,12 +25,13 @@ const (
 	ConditionDegraded string = "Degraded"
 )
 
-// Common reasons for EtcdCluster status conditions.// Reasons should be CamelCase and concise.
+// Common reasons for EtcdCluster status conditions. Reasons should be CamelCase and concise.
 const (
 	// General Reasons
 	ReasonReconciling      string = "Reconciling"
 	ReasonReconcileSuccess string = "ReconcileSuccess"
 	ReasonReconcileError   string = "ReconcileError" // Generic error
+	ReasonClusterHealthy   string = "ClusterHealthy"
 
 	// Available Reasons
 	ReasonClusterReady       string = "ClusterReady"

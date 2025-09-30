@@ -76,8 +76,6 @@ func (m *Manager) SetAvailable(status bool, reason, message string) {
 	conditionStatus := metav1.ConditionFalse
 	if status {
 		conditionStatus = metav1.ConditionTrue
-		// Typically, if Available becomes True, Degraded should be False.
-		m.SetDegraded(false, reason, message)
 	}
 	m.set(ConditionAvailable, conditionStatus, reason, message)
 }
@@ -87,11 +85,6 @@ func (m *Manager) SetProgressing(status bool, reason, message string) {
 	conditionStatus := metav1.ConditionFalse
 	if status {
 		conditionStatus = metav1.ConditionTrue
-		// If starting to progress, it's usually not fully Available yet.
-		// Ensure Available reflects this if not explicitly set later.
-		if !m.IsConditionTrue(ConditionAvailable) && m.IsConditionUnknown(ConditionAvailable) {
-			m.SetAvailable(false, reason, message)
-		}
 	}
 	m.set(ConditionProgressing, conditionStatus, reason, message)
 }
@@ -101,8 +94,6 @@ func (m *Manager) SetDegraded(status bool, reason, message string) {
 	conditionStatus := metav1.ConditionFalse
 	if status {
 		conditionStatus = metav1.ConditionTrue
-		// If Degraded becomes True, Available should typically be False.
-		m.SetAvailable(false, reason, message)
 	}
 	m.set(ConditionDegraded, conditionStatus, reason, message)
 }

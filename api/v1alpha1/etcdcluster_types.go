@@ -160,10 +160,7 @@ type EtcdClusterStatus struct {
 	// +optional
 	LeaderId string `json:"leaderId,omitempty"`
 
-	// Phase indicates the current lifecycle phase of the EtcdCluster.
-	// Examples: "Pending", "Initializing", "Running", "Scaling", "Upgrading", "Failed", "Idle".
-	// +optional
-	Phase string `json:"phase,omitempty"`
+	// TODO: expose LastDefragTime once the controller owns automated defragmentation.
 
 	// Members provides the status of each individual etcd member.
 	// +optional
@@ -206,36 +203,9 @@ type MemberStatus struct {
 	// +optional
 	IsLearner bool `json:"isLearner,omitempty"`
 
-	// ClientURL is one of the client URLs for this member.
+	// IsLeader indicates if this member is currently the cluster leader.
 	// +optional
-	ClientURL string `json:"clientURL,omitempty"`
-
-	// PeerURL is one of the peer URLs for this member.
-	// +optional
-	PeerURL string `json:"peerURL,omitempty"`
-
-	// DBSize is the current database size in bytes of this member, as reported by etcd.
-	// This is the physically allocated size.
-	// +optional
-	DBSize int64 `json:"dbSize,omitempty"`
-
-	// DBSizeInUse is the actual disk space logically in use by the database, in bytes, of this member.
-	// +optional
-	DBSizeInUse int64 `json:"dbSizeInUse,omitempty"`
-
-	// Alarms are active alarms on this member (e.g., "NOSPACE", "CORRUPT").
-	// This lists specific alarm types.
-	// +optional
-	Alarms []string `json:"alarms,omitempty"`
-
-	// ErrorMessage provides any error associated with fetching status for this member,
-	// or errors reported by the member itself via its StatusResponse.Errors field.
-	// +optional
-	ErrorMessage string `json:"errorMessage,omitempty"`
-
-	// TODO: Consider adding these in future iterations if deemed valuable:
-	// StorageVersion string `json:"storageVersion,omitempty"` // Raft storage version
-	// DowngradeInfo string `json:"downgradeInfo,omitempty"`   // Information about downgrade capabilities
+	IsLeader bool `json:"isLeader,omitempty"`
 }
 
 // +kubebuilder:object:root=true

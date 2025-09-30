@@ -25,7 +25,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -117,8 +116,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		patchErr := status.PatchStatusMutate(ctx, r.Client, etcdCluster, func(latest *ecv1alpha1.EtcdCluster) error {
 			// Apply the status we calculated during *this* reconcile cycle
 			latest.Status = calculatedStatus
-			// Ensure Phase is derived *before* patching
-			r.derivePhaseFromConditions(latest) // Pass the object being patched
 			return nil
 		})
 		if patchErr != nil {
@@ -182,6 +179,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
 			if err != nil {
 				logger.Error(err, "Failed to create StatefulSet")
+				cm.SetAvailable(false, status.ReasonResourceCreateFail, status.FormatError("Failed to create StatefulSet", err))
 				cm.SetProgressing(false, status.ReasonResourceCreateFail, status.FormatError("Failed to create StatefulSet", err))
 				cm.SetDegraded(true, status.ReasonResourceCreateFail, status.FormatError("Failed to create StatefulSet", err))
 				return ctrl.Result{}, err
@@ -195,6 +193,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
 			r.updateStatusFromStatefulSet(&calculatedStatus, nil)
+			cm.SetAvailable(false, status.ReasonStatefulSetGetError, status.FormatError("Failed to get StatefulSet", err))
 			cm.SetProgressing(false, status.ReasonStatefulSetGetError, status.FormatError("Failed to get StatefulSet", err)) // Stop progressing on persistent get error
 			cm.SetDegraded(true, status.ReasonStatefulSetGetError, status.FormatError("Failed to get StatefulSet", err))
 			r.updateStatusFromStatefulSet(&calculatedStatus, nil)
@@ -209,6 +208,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// This case should ideally not happen if error handling above is correct
 		err = fmt.Errorf("statefulSet is unexpectedly nil after get/create")
 		logger.Error(err, "Internal error")
+		cm.SetAvailable(false, status.ReasonReconcileError, err.Error())
 		cm.SetDegraded(true, "InternalError", err.Error())
 		r.updateStatusFromStatefulSet(&calculatedStatus, nil)
 		return ctrl.Result{}, err
@@ -222,6 +222,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	err = checkStatefulSetControlledByEtcdOperator(etcdCluster, sts)
 	if err != nil {
 		logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
+		cm.SetAvailable(false, status.ReasonNotOwnedResource, err.Error())
 		cm.SetDegraded(true, status.ReasonNotOwnedResource, err.Error())
 		return ctrl.Result{}, err
 	}
@@ -234,6 +235,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
 		if err != nil {
 			logger.Error(err, "Failed to scale StatefulSet to 1 replica")
+			cm.SetAvailable(false, status.ReasonResourceUpdateFail, status.FormatError("Failed to scale StatefulSet to 1", err))
 			cm.SetProgressing(false, status.ReasonResourceUpdateFail, status.FormatError("Failed to scale StatefulSet to 1", err))
 			cm.SetDegraded(true, status.ReasonResourceUpdateFail, status.FormatError("Failed to scale StatefulSet to 1", err))
 			return ctrl.Result{}, err
@@ -246,6 +248,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, etcdCluster, r.Scheme)
 	if err != nil {
 		logger.Error(err, "Failed to create Headless Service")
+		cm.SetAvailable(false, status.ReasonResourceCreateFail, status.FormatError("Failed to ensure Headless Service", err))
 		cm.SetProgressing(false, status.ReasonResourceCreateFail, status.FormatError("Failed to ensure Headless Service", err))
 		cm.SetDegraded(true, status.ReasonResourceCreateFail, status.FormatError("Failed to ensure Headless Service", err))
 		return ctrl.Result{}, err
@@ -272,9 +275,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		calculatedStatus.CurrentVersion = ""
 		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
 	}
-	// calculatedStatus.LastHealthCheckTime = metav1.Now() // TODO: Add this field
-	// TODO: Update CurrentVersion from healthInfos (e.g., from leaderStatus.Version if available)
-	// TODO: Populate UnhealthyMembers list based on healthInfos
+	// calculatedStatus.LastHealthCheckTime = metav1.Now() // TODO: Add this field in a future iteration.
+	// TODO: Populate UnhealthyMembers list based on healthInfos if exposure becomes necessary.
 
 	// Update member count
 	memberCnt := 0
@@ -282,8 +284,28 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		memberCnt = len(memberListResp.Members)
 	}
 	calculatedStatus.MemberCount = int32(memberCnt)
+
+	var (
+		leaderStatus *clientv3.StatusResponse
+		leaderIDHex  string
+	)
+	// Default to empty leader identity/version. We'll overwrite once a leader is confirmed.
+	calculatedStatus.LeaderId = ""
+	calculatedStatus.CurrentVersion = ""
+
+	if memberCnt > 0 {
+		_, leaderStatus = etcdutils.FindLeaderStatus(healthInfos, logger)
+		if leaderStatus != nil && leaderStatus.Header != nil {
+			leaderIDHex = fmt.Sprintf("%x", leaderStatus.Header.MemberId)
+			calculatedStatus.LeaderId = leaderIDHex
+			if leaderStatus.Version != "" {
+				calculatedStatus.CurrentVersion = leaderStatus.Version
+			}
+		}
+	}
+
 	// Populate the detailed member status slice using our new helper function.
-	calculatedStatus.Members = r.populateMemberStatuses(ctx, memberListResp, healthInfos)
+	calculatedStatus.Members = r.populateMemberStatuses(ctx, memberListResp, healthInfos, leaderIDHex)
 
 	// ---------------------------------------------------------------------
 	// 6. Handle Member/Replica Mismatch
@@ -313,6 +335,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
 		if err != nil {
 			logger.Error(err, "Failed to adjust StatefulSet replicas to match member count")
+			cm.SetAvailable(false, status.ReasonResourceUpdateFail, status.FormatError("Failed to adjust StatefulSet replicas to match member count", err))
 			cm.SetProgressing(false, status.ReasonResourceUpdateFail, status.FormatError("Failed to adjust StatefulSet replicas to match member count", err))
 			cm.SetDegraded(true, status.ReasonResourceUpdateFail, status.FormatError("Failed to adjust StatefulSet replicas to match member count", err))
 			return ctrl.Result{}, err
@@ -328,10 +351,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var (
 		learnerStatus *clientv3.StatusResponse
 		learner       uint64
-		leaderStatus  *clientv3.StatusResponse
 	)
 	if memberCnt > 0 {
-		_, leaderStatus = etcdutils.FindLeaderStatus(healthInfos, logger)
 		if leaderStatus == nil {
 			err = fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
 			logger.Error(err, "Leader election might be in progress or cluster unhealthy")
@@ -340,11 +361,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			cm.SetProgressing(true, status.ReasonLeaderNotFound, "Waiting for leader election") // Still progressing towards stable state
 			// If the leader is not available, let's wait for the leader to be elected
 			return ctrl.Result{RequeueAfter: requeueDuration}, err
-		}
-		calculatedStatus.LeaderId = fmt.Sprintf("%x", leaderStatus.Header.MemberId)
-		// Set the cluster's current version based on the leader's version.
-		if leaderStatus.Version != "" {
-			calculatedStatus.CurrentVersion = leaderStatus.Version
 		}
 
 		learner, learnerStatus = etcdutils.FindLearnerStatus(healthInfos, logger)
@@ -468,8 +484,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("EtcdCluster reconciled successfully and is healthy")
 		cm.SetAvailable(true, status.ReasonClusterReady, "Cluster is fully available and healthy")
 		cm.SetProgressing(false, status.ReasonReconcileSuccess, "Cluster reconciled to desired state")
-		cm.SetDegraded(false, status.ReasonClusterReady, "Cluster is healthy") // Explicitly clear Degraded
-		return ctrl.Result{}, nil                                              // Success! Defer will update status.
+		cm.SetDegraded(false, status.ReasonClusterHealthy, "Cluster is healthy") // Explicitly clear Degraded
+		return ctrl.Result{}, nil                                                // Success! Defer will update status.
 	} else {
 		logger.Info("EtcdCluster reached desired size, but some members are unhealthy")
 		cm.SetAvailable(false, status.ReasonMembersUnhealthy, "Cluster reached size, but some members are unhealthy")
@@ -479,54 +495,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Defer function will execute here before returning
-}
-
-// derivePhaseFromConditions determines the overall Phase based on the set Conditions.
-// NOTE: This logic needs refinement based on the exact conditions being set.
-func (r *EtcdClusterReconciler) derivePhaseFromConditions(cluster *ecv1alpha1.EtcdCluster) {
-	// Default to Pending if no other condition matches
-	phase := "Pending"
-
-	if cluster.Spec.Size == 0 {
-		phase = "Idle"
-	} else if meta.IsStatusConditionTrue(cluster.Status.Conditions, status.ConditionDegraded) {
-		// Check for fatal reasons first
-		degradedCondition := meta.FindStatusCondition(cluster.Status.Conditions, status.ConditionDegraded)
-		if degradedCondition != nil {
-			switch degradedCondition.Reason {
-			case status.ReasonResourceCreateFail, status.ReasonResourceUpdateFail, status.ReasonEtcdClientError, status.ReasonNotOwnedResource, "InternalError": // Add more fatal reasons if needed
-				phase = "Failed"
-			default:
-				phase = "Degraded"
-			}
-		} else {
-			phase = "Degraded" // Should have reason if Degraded is True
-		}
-	} else if meta.IsStatusConditionTrue(cluster.Status.Conditions, status.ConditionProgressing) {
-		// Determine specific progressing phase based on reason
-		progressingCondition := meta.FindStatusCondition(cluster.Status.Conditions, status.ConditionProgressing)
-		if progressingCondition != nil {
-			switch progressingCondition.Reason {
-			case status.ReasonCreatingResources:
-				phase = "Creating"
-			case status.ReasonInitializingCluster:
-				phase = "Initializing"
-			case status.ReasonScalingUp, status.ReasonScalingDown, status.ReasonMemberConfiguration, status.ReasonMembersMismatch:
-				phase = "Scaling"
-			case status.ReasonPromotingLearner, status.ReasonWaitingForLearner:
-				phase = "PromotingLearner"
-			default:
-				phase = "Progressing" // Generic progressing state if reason not specific
-			}
-		} else {
-			phase = "Progressing" // Should have reason if Progressing is True
-		}
-	} else if meta.IsStatusConditionTrue(cluster.Status.Conditions, status.ConditionAvailable) {
-		phase = "Running"
-	}
-	// Add logic for Terminating Phase if finalizers are implemented
-
-	cluster.Status.Phase = phase
 }
 
 func (r *EtcdClusterReconciler) updateStatusFromStatefulSet(
@@ -555,6 +523,7 @@ func (r *EtcdClusterReconciler) populateMemberStatuses(
 	ctx context.Context,
 	memberListResp *clientv3.MemberListResponse,
 	healthInfos []etcdutils.EpHealth,
+	leaderID string,
 ) []ecv1alpha1.MemberStatus {
 	logger := log.FromContext(ctx)
 	// If there's no member list, there's nothing to populate.
@@ -576,38 +545,30 @@ func (r *EtcdClusterReconciler) populateMemberStatuses(
 	// Iterate through the canonical member list from etcd.
 	for _, etcdMember := range memberListResp.Members {
 		// Start building the status for this specific member.
+		memberIDHex := fmt.Sprintf("%x", etcdMember.ID)
 		ms := ecv1alpha1.MemberStatus{
-			ID:        fmt.Sprintf("%x", etcdMember.ID), // Use hex representation for the uint64 ID.
+			ID:        memberIDHex,
 			Name:      etcdMember.Name,
 			IsLearner: etcdMember.IsLearner,
 		}
 
-		// Populate URLs, taking the first one if available.
-		if len(etcdMember.ClientURLs) > 0 {
-			ms.ClientURL = etcdMember.ClientURLs[0]
-		}
-		if len(etcdMember.PeerURLs) > 0 {
-			ms.PeerURL = etcdMember.PeerURLs[0]
+		if leaderID != "" && memberIDHex == leaderID {
+			ms.IsLeader = true
 		}
 
 		// Look up the detailed health status for this member in the map.
 		if healthInfo, found := healthMap[etcdMember.ID]; found {
 			// A health record was found for this member.
 			ms.IsHealthy = healthInfo.Health
-			ms.ErrorMessage = healthInfo.Error
-			ms.Alarms = healthInfo.Alarms // Directly use the pre-processed []string from EpHealth.
 
 			// Populate fields from the detailed StatusResponse if it exists.
 			if healthInfo.Status != nil {
 				ms.Version = healthInfo.Status.Version
-				ms.DBSize = healthInfo.Status.DbSize
-				ms.DBSizeInUse = healthInfo.Status.DbSizeInUse
 			}
 		} else {
 			// A member was present in the member list but we couldn't get its
 			// individual health status (e.g., its endpoint was unreachable during the check).
 			ms.IsHealthy = false
-			ms.ErrorMessage = "Health status for this member could not be retrieved."
 			logger.Info("No detailed health status found for etcd member, marking as unhealthy by default", "memberID", ms.ID, "memberName", ms.Name)
 		}
 
